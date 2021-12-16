@@ -1,328 +1,221 @@
-import cv2
+"""
+Simple example that connects to the first Crazyflie found, ramps up/down
+the motors and disconnects.
+"""
+import logging
 import time
+from threading import Thread
+from threading import Timer
+import random
+
+import cflib
+import cflib.crtp  # noqa
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.log import LogConfig
+from cflib.positioning.motion_commander import MotionCommander
+
 import sys
-import json
-from flask import Flask, redirect, url_for, render_template
-from flask_sqlalchemy import SQLAlchemy
-import mediapipe as mp
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-mp_hands = mp.solutions.hands
+sys.path.append('.')
+from gesture_detection import MovementVector
+DEFAULT_HEIGHT = 0.8
+TURN_RADIUS = 0.1
+LIMITS = [1, 1, 0.3]
 
-print("here0")
 
-app = Flask(__name__)
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///locations.sqlite3'
-# app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://postgres:justinaubin@localhost/positions.db'
- 
-# Creating an SQLAlchemy instance
-db = SQLAlchemy(app)
-db.init_app(app)
+logging.basicConfig(level=logging.ERROR)
 
-db = SQLAlchemy(app)
-class HandLocation(db.Model):
-    id = db.Column('id', db.Integer, primary_key = True)
-    #    name = db.Column(db.String(100))
-    hand_x = db.Column(db.String(50))  
-    hand_y = db.Column(db.String(50))
-    hand_z = db.Column(db.String(50))
+class DroneMotion:
+    """Example that connects to a Crazyflie and ramps the motors up/down and
+    the disconnects"""
 
-    def __init__(self, hand_x, hand_y, hand_z):
-        self.hand_x = hand_x
-        self.hand_y = hand_y
-        self.hand_z = hand_z
+    def __init__(self, link_uri, return_to_start=False, rubber_band=False, leash=False):
+        """ Initialize and run the example with the specified link_uri """
 
-class MovementVector(db.Model):
-    id = db.Column('id', db.Integer, primary_key = True)
-    roll = db.Column(db.String(50))  
-    pitch = db.Column(db.String(50))
-    yaw = db.Column(db.String(50))
+        self._cf = Crazyflie(rw_cache='./cache')
 
-    def __init__(self, roll, pitch, yaw):
-        self.roll = roll
-        self.pitch = pitch
-        self.yaw = yaw
+        self._cf.connected.add_callback(self._connected)
+        self._cf.disconnected.add_callback(self._disconnected)
+        self._cf.connection_failed.add_callback(self._connection_failed)
+        self._cf.connection_lost.add_callback(self._connection_lost)
 
-class HandTracker:
+        self._cf.open_link(link_uri)
+        self.return_to_start = return_to_start
+        self.rubber_band = rubber_band
+        self.leash = leash
 
-    def __init__(self):
-        # self.hand_locations = []
-        # For webcam input:
-        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        self.startCamera()
+
+        print('Connecting to %s' % link_uri)
+        self.is_connected = True 
+        self._param_check_list = []
+        self._param_groups = []
+
+    def hover(self):
+        with MotionCommander(self._cf, default_height=DEFAULT_HEIGHT):
+            time.sleep(2)
+        print("heeeee")
 
     @classmethod
-    def inBounds(cls, x_coor, y_coor):
-        if x_coor >= 1 or x_coor <= 0:
-            return False
-        if y_coor >= 1 or y_coor <= 0:
-            return False
-        
-        return True
+    def reachedLimit(cls, x_vector, y_vector, z_vector, distance_traveled):
+        x_traveled, y_traveled, z_traveled = distance_traveled
+        x_limit, y_limit, z_limit = LIMITS
 
-    @classmethod
-    def noMovement(cls, interval_average_x, interval_average_y, hand_width, hand_length):
-        '''Return True if hand stationary and in fist (based on hand measurements)'''
+        if x_traveled + x_vector > x_limit or x_traveled + x_vector < -x_limit:
+            x_vector = 0
+        if y_traveled + y_vector > y_limit or y_traveled + y_vector < -y_limit:
+            y_vector = 0
+        if z_traveled + z_vector > z_limit or z_traveled + z_vector < -z_limit:
+            z_vector = 0
 
-        # if interval_average_x and interval_average_x < 15 and interval_average_y and interval_average_y < 15:
-        #     print("false alarm")
-        if interval_average_x and interval_average_x > 15 or interval_average_y and interval_average_y > 15:
-            return False
-        if hand_width < 90 or hand_width > 150:
-            return False
-        if hand_length > 100:
-            return False
+        return x_vector, y_vector, z_vector
 
-        print(hand_width, hand_length)
+    def _connected(self, link_uri):
+        """ This callback is called form the Crazyflie API when a Crazyflie
+        has been connected and the TOCs have been downloaded."""
+        print('Connected to %s' % link_uri)
+        self._ramp_motors()
 
-        return True
+    def _a_propTest_callback(self, name, value):
+        """Callback for pid_attitude.pitch_kd"""
+        print('Readback: {0}={1}'.format(name, value))
 
-    @classmethod
-    def getAverages(cls, hand_landmarks, image_height, image_width):
-        average_x_position = 0
-        average_y_position = 0
-        average_z_position = 0
-        num_landmarks = 0
-        # TODO: right now closes if hand doesn 't move at all, but change to 
-        # only close if 
-        # this and in fist
-        for landmark_name in mp_hands.HandLandmark:
+    def _stab_log_error(self, logconf, msg):
+        """Callback from the log API when an error occurs"""
+        print('Error when logging %s: %s' % (logconf.name, msg))
 
-            x_coor = hand_landmarks.landmark[landmark_name].x
-            y_coor = hand_landmarks.landmark[landmark_name].y
-            z_coor = hand_landmarks.landmark[landmark_name].z
-            if HandTracker.inBounds(x_coor, y_coor):
-                num_landmarks += 1
+    def _stab_log_data(self, timestamp, data, logconf):
+        """Callback froma the log API when data arrives"""
+        print('[%d][%s]: %s' % (timestamp, logconf.name, data), flush=True)
+    def _connection_failed(self, link_uri, msg):
+        """Callback when connection initial connection fails (i.e no Crazyflie
+        at the specified address)"""
+        print('Connection to %s failed: %s' % (link_uri, msg))
 
-            average_x_position += x_coor * image_width
-            average_y_position += y_coor * image_height
-            average_z_position += z_coor * 1000
-        
-        if num_landmarks:
-            average_x_position /= num_landmarks
-            average_y_position /= num_landmarks
-            average_z_position /= num_landmarks
+    def _connection_lost(self, link_uri, msg):
+        """Callback when disconnected after a connection has been made (i.e
+        Crazyflie moves out of range)"""
+        print('Connection to %s lost: %s' % (link_uri, msg))
 
-        return average_x_position, average_y_position, average_z_position
+    def _disconnected(self, link_uri):
+        """Callback when the Crazyflie is disconnected (called in all cases)"""
+        print('Disconnected from %s' % link_uri)
 
-    @classmethod
-    def trackMovements(cls, last_ten_lists, positions):
-        # print("tracking")
+    def _ramp_motors(self):
+        print("ramp")
 
-        x_last_ten, y_last_ten, z_last_ten = last_ten_lists
-        x, y, z = positions
+        thrust_mult = 1
+        thrust_step = 100
+        thrust_dstep = 10
+        thrust = 30
+        pitch = 0
+        roll = 0
+        last_x = 325
+        last_y = 250
+        last_z = -50
+        yawrate = 0
+        start_height = 0.1
+        target_height = 0.3 
 
-        x_average_continual = sum(x_last_ten) / 10
-        y_average_continual = sum(y_last_ten) / 10
-        z_average_continual = sum(z_last_ten) / 10
-
-
+        num_prev_vectors = 0
+        hover_on = 1
         roll = 0
         pitch = 0
         yaw = 0
-        if z_average_continual > z + 5:
-            # print("EAST")
-            yaw = 0.3
-        elif z_average_continual < z - 5:
-            # print("WEST")
-            yaw = -0.3
-        else:
-            yaw = 0
-        # TODO: make more accurate by using percentage of hand taking up screen to increase instead of absolute
-        # because the closer hand is the easier it is to change
-        # average positions
-        if y_average_continual > y + 20:
-            # print("EAST")
-            roll = 0.5
-        elif y_average_continual < y - 20:
-            # print("WEST")
-            roll = -0.5
-        else:
-            roll = 0
+        cnt = 0
+        error = (-1000, -1000, -1000)
 
-        if x_average_continual > x + 30:
-            # print("EAST")
-            pitch = 0.5
-        elif x_average_continual < x - 30:
-            # print("WEST")
-            pitch = -0.5
-        else:
-            pitch = 0
+        x = y = z = 0
+        distance_traveled = [x, y, z]
+        iterations = 0
+        last_command = time.time()
+        first = True
+        with MotionCommander(self._cf, default_height=DEFAULT_HEIGHT) as mc:
+            while hover_on:
 
-        x_last_ten.pop(0)
-        x_last_ten.append(x)
-        y_last_ten.pop(0)
-        y_last_ten.append(y)
-        z_last_ten.pop(0)
-        z_last_ten.append(z)
-        
-        # loc = HandLocation(x_average_continual, y_average_continual, z_average_continual)
-        vector = MovementVector(roll, pitch, yaw)
-        print(f'vectors: {roll}, {pitch}, {yaw}')
-        db.session.add(vector)
-        db.session.commit()
-
-    def startCamera(self):
-        print("started")
-
-        with mp_hands.Hands(
-            model_complexity=0,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5) as hands:
-            prev_x_position = 325
-            prev_y_position = 250
-            prev_z_position = -50
-            
-            # change to infinity?
-            x_low = y_low = z_low = 1000
-            x_high = y_high = z_high = -1000
-            x_last_ten = [prev_x_position] * 10
-            y_last_ten = [prev_y_position] * 10
-            z_last_ten = [prev_z_position] * 10
-            prev_time = time.time()
-            # last_landmark = time.time()
-            # num_landmarks = len(mp_hands.HandLandmark)
-            while self.cap.isOpened():
-                # print("here2")
-                # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 700)
-                # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 700)
-                success, image = self.cap.read()
-                if not success:
-                    print("Ignoring empty camera frame.")
-                    # If loading a video, use 'break' instead of 'continue'.
-                    continue
-
-                # To improve performance, optionally mark the image as not writeable to
-                # pass by reference.
-                image.flags.writeable = False
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                results = hands.process(image)
-
-                # Draw the hand annotations on the image.
-                image.flags.writeable = True
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-                image_height, image_width, _ = image.shape
-                if results.multi_hand_landmarks:
-                    
-                    for hand_landmarks in results.multi_hand_landmarks:
-                        average_x_position, average_y_position, average_z_position = HandTracker.getAverages(hand_landmarks, image_height, image_width)
-
-                        # print(f'average x: {average_x_position}, average y: {average_y_position}')
-                        # print(f'average z: {average_z_position}')
-
-                        difference_x = average_x_position - prev_x_position
-                        difference_y = average_y_position - prev_y_position
-                        difference_z = average_z_position - prev_z_position
-
-                        # loc = HandLocation(difference_x, difference_y, difference_z)
-                        # loc = HandLocation(average_x_position, average_y_position, average_z_position)
-                        # db.session.add(loc)
-                        # db.session.commit()
-
-                        # TODO: make close if off screen for too long?
-                        time_elasped = time.time() - prev_time
-                        # print(time_elasped)
-                        if average_x_position > x_high:
-                            x_high = average_x_position
-                        if average_x_position < x_low:
-                            x_low = average_x_position
-
-                        if average_y_position > y_high:
-                            y_high = average_y_position
-                        if average_y_position < y_low:
-                            y_low = average_y_position
-
-                        if average_z_position > z_high:
-                            z_high = average_z_position
-                        if average_z_position < z_low:
-                            z_low = average_z_position
+                vectors = MovementVector.query.all()
+                num_vectors = len(vectors)
+                if not num_prev_vectors or num_vectors > num_prev_vectors:
+                    for i in range(num_prev_vectors, num_vectors):
                         
-                        # TODO: fix time problem where if you show hand right at end 
-                        # of cycle
-                        # it closes because the average didn't move
-                        # yaw: more positive further away, more negative closer
-                        if time_elasped >= 2:
+                        vector = vectors[i]
+                        if time.time() - float(vector.timestamp) < 0.4:
+                            x_vector, y_vector, z_vector, turn_vector = float(vector.x_vector), float(vector.y_vector), float(vector.z_vector), float(vector.turn_vector)
                             
-                            # print(x_high,  x_low, y_low, y_high)
-                            interval_average_x = x_high - x_low
-                            interval_average_y = y_high - y_low
-                            interval_average_z = z_high - z_low
-                            # print(interval_average_x, interval_average_y)
-                            thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP].x * image_width
-                            pinky_tip = hand_landmarks.landmark[mp_hands.HandLandmark.PINKY_TIP].x * image_width
-                            hand_width = thumb_tip - pinky_tip
+                            if 0:
+                                pass
+                            else:
+                                last_command = time.time()
+                                if (x_vector, y_vector, z_vector) == error:
+                                    print(f"x_vector: {x_vector}, y_vector: {y_vector}, z_vector: {z_vector} {i}")
+                                    hover_on = 0
+                                    break
+                                elif turn_vector == 1:
+                                    mc.start_circle_left(self, TURN_RADIUS, velocity=0.3)
+                                    time.sleep(0.5)
+                                elif turn_vector == -1:
+                                    mc.start_circle_right(self, TURN_RADIUS, velocity=0.3)
+                                    time.sleep(0.5)
+                                elif self.rubber_band:
+                                    mc.move_distance(x_vector, y_vector, z_vector, velocity=0.2)
+                                    time.sleep(0.5)
+                                    mc.move_distance(-x_vector, -y_vector, -z_vector, velocity=0.2)
+                                    time.sleep(0.5)
+                                elif self.leash:
+                                    x_vector, y_vector, z_vector = DroneMotion.reachedLimit(x_vector, y_vector, z_vector, distance_traveled)
+                                    mc.move_distance(x_vector, y_vector, z_vector, velocity=0.1)
+                                else:
+                                    mc.move_distance(x_vector, y_vector, z_vector, velocity=0.2)
+                                    time.sleep(0.15)
 
-                            middle_tip = hand_landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP].x * image_height
-                            wrist = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST].x * image_height
-                            hand_length = middle_tip - wrist
+                            print(f"x_vector: {x_vector}, y_vector: {y_vector}, z_vector: {z_vector} {i}, turn_vector: {turn_vector}")
+                            x += x_vector
+                            y += y_vector
+                            z += z_vector
+                            distance_traveled = [x, y, z]
 
-                            if HandTracker.noMovement(interval_average_x, interval_average_y, hand_width, hand_length):
-                                print("yes")
-                                # loc = HandLocation(-1000, -1000, -1000)
-                                vector = MovementVector(-1000, -1000, -1000)
-                                db.session.add(vector)
-                                db.session.commit()
-                                self.closeCamera()
 
-                            x_high = y_high = z_high = -1000
-                            x_low = y_low = z_low = 1000
-                            prev_time = time.time()
+                    num_prev_vectors = num_vectors
 
-                        prev_x_position = average_x_position
-                        prev_y_position = average_y_position
-                        prev_z_position = average_z_position
+            if self.return_to_start:
+                if x:
+                    mc.move_distance(x, 0, 0, velocity=0.1)
+                    time.sleep(0.3)
+                if y:
+                    mc.move_distance(0, y, 0, velocity=0.1)
+                    time.sleep(0.3)
+                if z:
+                    mc.move_distance(0, 0, z, velocity=0.1)
+                    time.sleep(0.3)
 
-                        # if difference_x > 200 and difference_y < -150:
-                        #     print("NORTHWEST")
-                        # elif difference_x > 200 and difference_y > 150:
-                        #     print("SOUTHWEST")
-                        # elif difference_x > 200: 
-                        #     print("WEST")
-                        # elif difference_x < -200 and difference_y < -150:
-                        #     print("NORTHEAST")
-                        # elif difference_x < -200 and difference_y > 150:
-                        #     print("SOUTHEAST")
-                        # elif difference_x < -200:
-                        #     print("EAST")
-                        # elif difference_y < -150:
-                        #     print("NORTH")
-                        # elif difference_y > 150:
-                        #     print("SOUTH")
-                        # elif difference_z < -150:
-                        #     print("FORWARD")
-                        # elif difference_z > 20:
-                        #     print("BACK")
+        print('end', flush=True)
+        self._cf.close_link()
 
-                        last_ten_lists = (x_last_ten, y_last_ten, z_last_ten)
-                        positions = (average_x_position, average_y_position, average_z_position)
-
-                        HandTracker.trackMovements(last_ten_lists, positions)
-
-                        mp_drawing.draw_landmarks(
-                            image,
-                            hand_landmarks,
-                            mp_hands.HAND_CONNECTIONS,
-                            mp_drawing_styles.get_default_hand_landmarks_style(),
-                            mp_drawing_styles.get_default_hand_connections_style())
-                # Flip the image horizontally for a selfie-view display.
-                cv2.imshow('MediaPipe Hands', cv2.flip(image, 1))
-                if cv2.waitKey(5) & 0xFF == 27:
-                    break
-        self.cap.release()
-        cv2.destroyAllWindows()
-
-    def closeCamera(self):
-        print("close")
-        self.cap.release()
-        cv2.destroyAllWindows()
-        # delete all previous locations in db after camera closes
-        num_rows_deleted = db.session.query(MovementVector).delete()
-        db.session.commit()
-        print(num_rows_deleted)
-        sys.exit(0)
 
 if __name__ == '__main__':
-   db.create_all()
-   hand_positions = HandTracker()
-#    app.run(debug = True)
+    print("start")
+    # Initialize the low-level drivers (don't list the debug drivers)
+    cflib.crtp.init_drivers(enable_debug_driver=False)
+    # Scan for Crazyflies and use the first one found
+    print('Scanning interfaces for Crazyflies...')
+    available = cflib.crtp.scan_interfaces()
+    print('Crazyflies found:')
+    for i in available:
+        print(i[0])
+
+    if len(available) > 0:
+        length = len(sys.argv)
+        return_to_start = rubber_band = leash = False
+        
+        for arg in sys.argv:
+            if arg == "return":
+                return_to_start = True
+            elif arg == "rubber_band":
+                rubber_band = True
+            elif arg == "leash":
+                leash = True
+
+        print(return_to_start, rubber_band, leash)
+        DroneMotion(available[0][0], return_to_start=return_to_start, rubber_band=rubber_band, leash=leash)
+
+    else:
+        print('No Crazyflies found, cannot run example')
+        sys.exit(0)
